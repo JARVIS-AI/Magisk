@@ -3,18 +3,103 @@
 #include <time.h>
 #include <string.h>
 #include <unistd.h>
+#include <dlfcn.h>
 #include <sys/stat.h>
 
-#include <magisk.h>
-#include <db.h>
-#include <daemon.h>
-#include <utils.h>
+#include <magisk.hpp>
+#include <db.hpp>
+#include <daemon.hpp>
+#include <utils.hpp>
 
-#define DB_VERSION 9
+#define DB_VERSION 10
 
 using namespace std;
 
+typedef struct sqlite3 sqlite3;
+
 static sqlite3 *mDB = nullptr;
+
+// SQLite APIs
+
+#define SQLITE_OPEN_READWRITE        0x00000002  /* Ok for sqlite3_open_v2() */
+#define SQLITE_OPEN_CREATE           0x00000004  /* Ok for sqlite3_open_v2() */
+#define SQLITE_OPEN_FULLMUTEX        0x00010000  /* Ok for sqlite3_open_v2() */
+
+static int (*sqlite3_open_v2)(
+		const char *filename,
+		sqlite3 **ppDb,
+		int flags,
+		const char *zVfs);
+static const char *(*sqlite3_errmsg)(sqlite3 *db);
+static int (*sqlite3_close)(sqlite3 *db);
+static void (*sqlite3_free)(void *v);
+static int (*sqlite3_exec)(
+		sqlite3 *db,
+		const char *sql,
+		int (*callback)(void*, int, char**, char**),
+		void *v,
+		char **errmsg);
+
+// Internal Android linker APIs
+
+static void (*android_get_LD_LIBRARY_PATH)(char *buffer, size_t buffer_size);
+static void (*android_update_LD_LIBRARY_PATH)(const char *ld_library_path);
+
+#define DLERR(ptr) if (!(ptr)) { \
+	LOGE("db: %s\n", dlerror()); \
+	return false; \
+}
+
+#define DLOAD(handle, arg) {\
+	auto f = dlsym(handle, #arg); \
+	DLERR(f) \
+	*(void **) &(arg) = f; \
+}
+
+#ifdef __LP64__
+constexpr char apex_path[] = "/apex/com.android.runtime/lib64:/apex/com.android.art/lib64:";
+#else
+constexpr char apex_path[] = "/apex/com.android.runtime/lib:/apex/com.android.art/lib:";
+#endif
+
+static int dl_init = 0;
+
+static bool dload_sqlite() {
+	if (dl_init)
+		return dl_init > 0;
+	dl_init = -1;
+
+	auto sqlite = dlopen("libsqlite.so", RTLD_LAZY);
+	if (!sqlite) {
+		// Should only happen on Android 10+
+		auto dl = dlopen("libdl_android.so", RTLD_LAZY);
+		DLERR(dl);
+
+		DLOAD(dl, android_get_LD_LIBRARY_PATH);
+		DLOAD(dl, android_update_LD_LIBRARY_PATH);
+
+		// Inject APEX into LD_LIBRARY_PATH
+		char ld_path[4096];
+		memcpy(ld_path, apex_path, sizeof(apex_path));
+		constexpr int len = sizeof(apex_path) - 1;
+		android_get_LD_LIBRARY_PATH(ld_path + len, sizeof(ld_path) - len);
+		android_update_LD_LIBRARY_PATH(ld_path);
+		sqlite = dlopen("libsqlite.so", RTLD_LAZY);
+
+		// Revert LD_LIBRARY_PATH just in case
+		android_update_LD_LIBRARY_PATH(ld_path + len);
+	}
+	DLERR(sqlite);
+
+	DLOAD(sqlite, sqlite3_open_v2);
+	DLOAD(sqlite, sqlite3_errmsg);
+	DLOAD(sqlite, sqlite3_close);
+	DLOAD(sqlite, sqlite3_exec);
+	DLOAD(sqlite, sqlite3_free);
+
+	dl_init = 1;
+	return true;
+}
 
 int db_strings::getKeyIdx(string_view key) const {
 	int idx = DB_STRING_NUM;
@@ -30,7 +115,7 @@ db_settings::db_settings() {
 	data[ROOT_ACCESS] = ROOT_ACCESS_APPS_AND_ADB;
 	data[SU_MULTIUSER_MODE] = MULTIUSER_MODE_OWNER_ONLY;
 	data[SU_MNT_NS] = NAMESPACE_MODE_REQUESTER;
-	data[HIDE_CONFIG] = true;
+	data[HIDE_CONFIG] = false;
 }
 
 int db_settings::getKeyIdx(string_view key) const {
@@ -50,6 +135,9 @@ static int ver_cb(void *ver, int, char **data, char **) {
 #define err_ret(e) if (e) return e;
 
 static char *open_and_init_db(sqlite3 *&db) {
+	if (!dload_sqlite())
+		return strdup("Cannot load libsqlite.so");
+
 	int ret = sqlite3_open_v2(MAGISKDB, &db,
 			SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX, nullptr);
 	if (ret)
@@ -70,13 +158,6 @@ static char *open_and_init_db(sqlite3 *&db) {
 				"CREATE TABLE IF NOT EXISTS policies "
 				"(uid INT, package_name TEXT, policy INT, until INT, "
 				"logging INT, notification INT, PRIMARY KEY(uid))",
-				nullptr, nullptr, &err);
-		err_ret(err);
-		// Logs
-		sqlite3_exec(db,
-				"CREATE TABLE IF NOT EXISTS logs "
-				"(from_uid INT, package_name TEXT, app_name TEXT, from_pid INT, "
-				"to_uid INT, action INT, time INT, command TEXT)",
 				nullptr, nullptr, &err);
 		err_ret(err);
 		// Settings
@@ -142,6 +223,12 @@ static char *open_and_init_db(sqlite3 *&db) {
 				nullptr, nullptr, &err);
 		err_ret(err);
 		ver = 9;
+		upgrade = true;
+	}
+	if (ver < 10) {
+		sqlite3_exec(db, "DROP TABLE IF EXISTS logs", nullptr, nullptr, &err);
+		err_ret(err);
+		ver = 10;
 		upgrade = true;
 	}
 
@@ -219,7 +306,6 @@ int get_db_strings(db_strings &str, int key) {
 	char *err;
 	auto string_cb = [&](db_row &row) -> bool {
 		str[row["key"]] = row["value"];
-		LOGD("magiskdb: query %s=[%s]\n", row["key"].data(), row["value"].data());
 		return true;
 	};
 	if (key >= 0) {
@@ -233,7 +319,7 @@ int get_db_strings(db_strings &str, int key) {
 	return 0;
 }
 
-int get_uid_policy(int uid, su_access &su) {
+int get_uid_policy(su_access &su, int uid) {
 	char query[256], *err;
 	sprintf(query, "SELECT policy, logging, notification FROM policies "
 			"WHERE uid=%d AND (until=0 OR until>%li)", uid, time(nullptr));
@@ -248,50 +334,70 @@ int get_uid_policy(int uid, su_access &su) {
 	return 0;
 }
 
-int validate_manager(string &alt_pkg, int userid, struct stat *st) {
+bool check_manager(string *pkg) {
+	db_strings str;
+	get_db_strings(str, SU_MANAGER);
+	bool ret = validate_manager(str[SU_MANAGER], 0, nullptr);
+	if (pkg) {
+		if (ret)
+			pkg->swap(str[SU_MANAGER]);
+		else
+			*pkg = "xxx";  /* Make sure the return pkg can never exist */
+	}
+	return ret;
+}
+
+bool validate_manager(string &pkg, int userid, struct stat *st) {
 	struct stat tmp_st;
 	if (st == nullptr)
 		st = &tmp_st;
 
 	// Prefer DE storage
-	const char *base = access("/data/user_de", F_OK) == 0 ? "/data/user_de" : "/data/user";
 	char app_path[128];
-	sprintf(app_path, "%s/%d/%s", base, userid, alt_pkg.empty() ? "xxx" : alt_pkg.data());
-	if (stat(app_path, st)) {
+	sprintf(app_path, "%s/%d/%s", APP_DATA_DIR, userid, pkg.data());
+	if (pkg.empty() || stat(app_path, st)) {
 		// Check the official package name
-		sprintf(app_path, "%s/%d/" JAVA_PACKAGE_NAME, base, userid);
+		sprintf(app_path, "%s/%d/" JAVA_PACKAGE_NAME, APP_DATA_DIR, userid);
 		if (stat(app_path, st)) {
 			LOGE("su: cannot find manager");
 			memset(st, 0, sizeof(*st));
-			alt_pkg.clear();
-			return 1;
+			pkg.clear();
+			return false;
 		} else {
 			// Switch to official package if exists
-			alt_pkg = JAVA_PACKAGE_NAME;
+			pkg = JAVA_PACKAGE_NAME;
 		}
 	}
-	return 0;
+	return true;
 }
 
 void exec_sql(int client) {
+	run_finally f([=]{ close(client); });
 	char *sql = read_string(client);
-	FILE *out = fdopen(recv_fd(client), "a");
 	char *err = db_exec(sql, [&](db_row &row) -> bool {
-		bool first = false;
+		string out;
+		bool first = true;
 		for (auto it : row) {
-			if (first) fprintf(out, "|");
-			else first = true;
-			fprintf(out, "%s=%s", it.first.data(), it.second.data());
+			if (first) first = false;
+			else out += '|';
+			out += it.first;
+			out += '=';
+			out += it.second;
 		}
-		fprintf(out, "\n");
+		write_int(client, out.length());
+		xwrite(client, out.data(), out.length());
 		return true;
 	});
 	free(sql);
-	fclose(out);
-	db_err_cmd(err,
-		write_int(client, 1);
-		return;
-	);
 	write_int(client, 0);
-	close(client);
+	db_err_cmd(err, return; );
+}
+
+bool db_err(char *e) {
+	if (e) {
+		LOGE("sqlite3_exec: %s\n", e);
+		sqlite3_free(e);
+		return true;
+	}
+	return false;
 }

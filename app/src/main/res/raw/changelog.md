@@ -1,3 +1,3 @@
-# v7.1.2
-- Support patching Samsung AP firmware
-- Much better module downloading mechanism
+# v7.5.1
+- Fix toggling app components in MagiskHide screen
+- Update translations

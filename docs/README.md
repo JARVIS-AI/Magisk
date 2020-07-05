@@ -1,34 +1,13 @@
-# Magisk Documentations
-(Updated on 2019.5.1)
+# Magisk Documentation
+(Updated on 2020.3.23)
 
-- [Installation](install.md)
-    - [Prerequisite](install.md#prerequisite)
-    - [Custom Recovery](install.md#custom-recovery)
-    - [Boot Image Patching](install.md#boot-image-patching)
-    - [Samsung (System-as-root)](install.md#samsung-system-as-root)
-    - [Huawei](install.md#huawei)
-- [Tutorials](tutorials.md)
-    - [OTA Installation](tutorials.md#ota-installation)
-    - [Best Practices for MagiskHide](tutorials.md#best-practices-for-magiskhide)
+- [Installation Instructions](install.md)
+- [OTA Upgrade Guides](ota.md)
 
-The followings are for developers
+The following sections are for developers
 
-- [Magisk Details](details.md)
-    - [File Structure](details.md#file-structure)
-    - [Magisk Booting Process](details.md#magisk-booting-process)
-    - [Resetprop](details.md#resetprop)
-    - [Magic Mount](details.md#magic-mount)
-    - [Miscellaneous](details.md#miscellaneous)
-- [Magisk Tools](tools.md)
 - [Developer Guides](guides.md)
-    - [Magisk Modules](guides.md#magisk-modules)
-    - [Magisk Module Installer](guides.md#magisk-module-installer)
-    - [Submit Modules](guides.md#submit-modules)
-    - [Notes on Partitions](guides.md#notes-on-partitions)
-    - [Boot Scripts](guides.md#boot-scripts)
-    - [Remove Files](guides.md#remove-files)
-    - [Remove Folders](guides.md#remove-folders)
+- [Magisk Tools](tools.md)
+- [Internal Details](details.md)
+- [Android Booting Shenanigans](boot.md)
 - [Deployment](deploy.md)
-    - [Systemless](deploy.md#systemless)
-    - [System Only](deploy.md#system-only)
-    - [Exploits](deploy.md#exploits)

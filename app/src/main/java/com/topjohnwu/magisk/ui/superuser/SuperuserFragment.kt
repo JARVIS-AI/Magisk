@@ -1,25 +1,20 @@
 package com.topjohnwu.magisk.ui.superuser
 
 import com.topjohnwu.magisk.R
-import com.topjohnwu.magisk.databinding.FragmentSuperuserBinding
-import com.topjohnwu.magisk.ui.base.MagiskFragment
+import com.topjohnwu.magisk.databinding.FragmentSuperuserMd2Binding
+import com.topjohnwu.magisk.ui.base.BaseUIFragment
 import org.koin.androidx.viewmodel.ext.android.viewModel
 
-class SuperuserFragment :
-    MagiskFragment<SuperuserViewModel, FragmentSuperuserBinding>() {
+class SuperuserFragment : BaseUIFragment<SuperuserViewModel, FragmentSuperuserMd2Binding>() {
 
-    override val layoutRes: Int = R.layout.fragment_superuser
-    override val viewModel: SuperuserViewModel by viewModel()
+    override val layoutRes = R.layout.fragment_superuser_md2
+    override val viewModel by viewModel<SuperuserViewModel>()
 
     override fun onStart() {
         super.onStart()
-        setHasOptionsMenu(true)
-        requireActivity().setTitle(R.string.superuser)
+        activity.title = resources.getString(R.string.superuser)
     }
 
-    override fun onResume() {
-        super.onResume()
-        viewModel.updatePolicies()
-    }
+    override fun onPreBind(binding: FragmentSuperuserMd2Binding) {}
 
 }

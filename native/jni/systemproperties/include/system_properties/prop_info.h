@@ -30,10 +30,10 @@
 
 #include <stdatomic.h>
 #include <stdint.h>
-#include <sys/system_properties.h>
+//#include <sys/system_properties.h>
+#include "../system_properties.h"
 
 #include "private/bionic_macros.h"
-#include "hacks.h"
 
 // The C11 standard doesn't allow atomic loads from const fields,
 // though C++11 does.  Fudge it until standards get straightened out.
@@ -84,7 +84,7 @@ struct prop_info {
   prop_info(const char* name, uint32_t namelen, uint32_t long_offset);
 
  private:
-  DISALLOW_IMPLICIT_CONSTRUCTORS(prop_info);
+  BIONIC_DISALLOW_IMPLICIT_CONSTRUCTORS(prop_info);
 };
 
 static_assert(sizeof(prop_info) == 96, "sizeof struct prop_info must be 96 bytes");

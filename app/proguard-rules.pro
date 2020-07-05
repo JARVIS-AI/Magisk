@@ -16,43 +16,36 @@
 #   public *;
 #}
 
-# BouncyCastle
--keep,allowoptimization class org.bouncycastle.jcajce.provider.asymmetric.rsa.**SHA1** { *; }
--keep,allowoptimization class org.bouncycastle.jcajce.provider.asymmetric.RSA** { *; }
--keep,allowoptimization class org.bouncycastle.jcajce.provider.digest.SHA1** { *; }
--dontwarn javax.naming.**
+# Kotlin
+-assumenosideeffects class kotlin.jvm.internal.Intrinsics {
+	public static void checkExpressionValueIsNotNull(...);
+	public static void checkNotNullExpressionValue(...);
+	public static void checkReturnedValueIsNotNull(...);
+	public static void checkFieldIsNotNull(...);
+	public static void checkParameterIsNotNull(...);
+}
+
+# Stubs
+-keep class a.* { *; }
 
 # Snet
--keepclassmembers class com.topjohnwu.magisk.utils.ISafetyNetHelper { *; }
--keep,allowobfuscation interface com.topjohnwu.magisk.utils.ISafetyNetHelper$Callback
--keepclassmembers class * implements com.topjohnwu.magisk.utils.ISafetyNetHelper$Callback {
+-keepclassmembers class com.topjohnwu.magisk.core.utils.SafetyNetHelper { *; }
+-keep,allowobfuscation interface com.topjohnwu.magisk.core.utils.SafetyNetHelper$Callback
+-keepclassmembers class * implements com.topjohnwu.magisk.core.utils.SafetyNetHelper$Callback {
   void onResponse(int);
 }
 
-# Keep all fragment constructors
--keepclassmembers class * extends androidx.fragment.app.Fragment {
-  public <init>(...);
-}
+# Fragments
+-keep,allowobfuscation class * extends androidx.fragment.app.Fragment
 
-# DelegateWorker
--keep,allowobfuscation class * extends com.topjohnwu.magisk.model.worker.DelegateWorker
-
-# BootSigner
--keepclassmembers class com.topjohnwu.signing.BootSigner { *; }
-
-# SVG
--dontwarn com.caverock.androidsvg.SVGAndroidRenderer
-
-# RetroStreams
--dontwarn java9.**
-
-# Strip logging
--assumenosideeffects class com.topjohnwu.magisk.utils.Logger {
-  public *** debug(...);
+# Strip Timber verbose and debug logging
+-assumenosideeffects class timber.log.Timber.Tree {
+  public void v(**);
+  public void d(**);
 }
 
 # Excessive obfuscation
--repackageclasses 'a'
+-repackageclasses
 -allowaccessmodification
 
 # QOL

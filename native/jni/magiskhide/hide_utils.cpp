@@ -1,67 +1,34 @@
 #include <sys/types.h>
 #include <sys/stat.h>
-#include <sys/mount.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <dirent.h>
 #include <string.h>
-#include <libgen.h>
 
-#include <magisk.h>
-#include <utils.h>
-#include <resetprop.h>
-#include <db.h>
-#include <selinux.h>
+#include <magisk.hpp>
+#include <utils.hpp>
+#include <db.hpp>
 
-#include "magiskhide.h"
+#include "magiskhide.hpp"
 
 using namespace std;
 
 static pthread_t proc_monitor_thread;
+static bool hide_state = false;
 
-static const char *prop_key[] =
-	{ "ro.boot.vbmeta.device_state", "ro.boot.verifiedbootstate", "ro.boot.flash.locked",
-	  "ro.boot.veritymode", "ro.boot.warranty_bit", "ro.warranty_bit", "ro.debuggable",
-	  "ro.secure", "ro.build.type", "ro.build.tags", "ro.build.selinux", nullptr };
-
-static const char *prop_value[] =
-	{ "locked", "green", "1",
-	  "enforcing", "0", "0", "0",
-	  "1", "user", "release-keys", "0", nullptr };
-
-void manage_selinux() {
-	char val;
-	int fd = xopen(SELINUX_ENFORCE, O_RDONLY);
-	xxread(fd, &val, sizeof(val));
-	close(fd);
-	// Permissive
-	if (val == '0') {
-		chmod(SELINUX_ENFORCE, 0640);
-		chmod(SELINUX_POLICY, 0440);
-	}
-}
-
-static void hide_sensitive_props() {
-	LOGI("hide_utils: Hiding sensitive props\n");
-
-	// Hide all sensitive props
-	for (int i = 0; prop_key[i]; ++i) {
-		auto value = getprop(prop_key[i]);
-		if (!value.empty() && value != prop_value[i])
-			setprop(prop_key[i], prop_value[i], false);
-	}
-}
+// This locks the 2 variables above
+static pthread_mutex_t hide_state_lock = PTHREAD_MUTEX_INITIALIZER;
 
 // Leave /proc fd opened as we're going to read from it repeatedly
 static DIR *procfp;
-void crawl_procfs(const function<bool (int)> &fn) {
+void crawl_procfs(const function<bool(int)> &fn) {
 	rewinddir(procfp);
 	crawl_procfs(procfp, fn);
 }
 
-void crawl_procfs(DIR *dir, const function<bool (int)> &fn) {
+void crawl_procfs(DIR *dir, const function<bool(int)> &fn) {
 	struct dirent *dp;
 	int pid;
 	while ((dp = readdir(dir))) {
@@ -71,62 +38,61 @@ void crawl_procfs(DIR *dir, const function<bool (int)> &fn) {
 	}
 }
 
+bool hide_enabled() {
+	mutex_guard g(hide_state_lock);
+	return hide_state;
+}
+
+void set_hide_state(bool state) {
+	mutex_guard g(hide_state_lock);
+	hide_state = state;
+}
+
 static bool proc_name_match(int pid, const char *name) {
 	char buf[4019];
-	FILE *f;
-#if 0
-	sprintf(buf, "/proc/%d/comm", pid);
-	if ((f = fopen(buf, "re"))) {
+	sprintf(buf, "/proc/%d/cmdline", pid);
+	if (FILE *f = fopen(buf, "re")) {
 		fgets(buf, sizeof(buf), f);
 		fclose(f);
 		if (strcmp(buf, name) == 0)
 			return true;
-	} else {
-		// The PID is already killed
-		return false;
-	}
-#endif
-
-	sprintf(buf, "/proc/%d/cmdline", pid);
-	if ((f = fopen(buf, "re"))) {
-		fgets(buf, sizeof(buf), f);
-		fclose(f);
-		if (strcmp(basename(buf), name) == 0)
-			return true;
 	}
 	return false;
-
-#if 0
-	sprintf(buf, "/proc/%d/exe", pid);
-	ssize_t len;
-	if ((len = readlink(buf, buf, sizeof(buf))) < 0)
-		return false;
-	buf[len] = '\0';
-	return strcmp(basename(buf), name) == 0;
-#endif
 }
 
-static void kill_process(const char *name) {
+static void kill_process(const char *name, bool multi = false) {
 	crawl_procfs([=](int pid) -> bool {
 		if (proc_name_match(pid, name)) {
 			if (kill(pid, SIGTERM) == 0)
 				LOGD("hide_utils: killed PID=[%d] (%s)\n", pid, name);
-			return false;
+			return multi;
 		}
 		return true;
 	});
 }
 
-void clean_magisk_props() {
-	getprop([](const char *name, auto, auto) -> void {
-		if (strstr(name, "magisk"))
-			deleteprop(name);
-	}, nullptr, false);
+static bool validate(const char *s) {
+	bool dot = false;
+	for (char c; (c = *s); ++s) {
+		if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+			(c >= '0' && c <= '9') || c == '_' || c == ':') {
+			continue;
+		}
+		if (c == '.') {
+			dot = true;
+			continue;
+		}
+		return false;
+	}
+	return dot;
 }
 
 static int add_list(const char *pkg, const char *proc = "") {
 	if (proc[0] == '\0')
 		proc = pkg;
+
+	if (!validate(pkg) || !validate(proc))
+		return HIDE_INVALID_PKG;
 
 	for (auto &hide : hide_set)
 		if (hide.first == pkg && hide.second == proc)
@@ -143,7 +109,7 @@ static int add_list(const char *pkg, const char *proc = "") {
 
 	// Critical region
 	{
-		MutexGuard lock(monitor_lock);
+		mutex_guard lock(monitor_lock);
 		hide_set.emplace(pkg, proc);
 	}
 
@@ -164,17 +130,15 @@ int add_list(int client) {
 static int rm_list(const char *pkg, const char *proc = "") {
 	{
 		// Critical region
-		MutexGuard lock(monitor_lock);
+		mutex_guard lock(monitor_lock);
 		bool remove = false;
-		auto next = hide_set.begin();
-		decltype(next) cur;
-		while (next != hide_set.end()) {
-			cur = next;
-			++next;
-			if (cur->first == pkg && (proc[0] == '\0' || cur->second == proc)) {
+		for (auto it = hide_set.begin(); it != hide_set.end();) {
+			if (it->first == pkg && (proc[0] == '\0' || it->second == proc)) {
 				remove = true;
-				LOGI("hide_list rm: [%s]\n", cur->second.data());
-				hide_set.erase(cur);
+				LOGI("hide_list rm: [%s]\n", it->second.data());
+				it = hide_set.erase(it);
+			} else {
+				++it;
 			}
 		}
 		if (!remove)
@@ -209,9 +173,11 @@ static void init_list(const char *pkg, const char *proc) {
 	kill_process(proc);
 }
 
-#define LEGACY_LIST MODULEROOT "/.core/hidelist"
+#define SNET_PROC    "com.google.android.gms.unstable"
+#define GMS_PKG      "com.google.android.gms"
+#define MICROG_PKG   "org.microg.gms.droidguard"
 
-bool init_list() {
+static bool init_list() {
 	LOGD("hide_list: initialize\n");
 
 	char *err = db_exec("SELECT * FROM hidelist", [](db_row &row) -> bool {
@@ -220,20 +186,20 @@ bool init_list() {
 	});
 	db_err_cmd(err, return false);
 
-	// Migrate old hide list into database
-	if (access(LEGACY_LIST, R_OK) == 0) {
-		file_readline(LEGACY_LIST, [](string_view s) -> bool {
-			add_list(s.data());
-			return true;
-		});
-		unlink(LEGACY_LIST);
+	// If Android Q+, also kill blastula pool
+	if (SDK_INT >= 29) {
+		kill_process("usap32", true);
+		kill_process("usap64", true);
 	}
 
 	// Add SafetyNet by default
-	rm_list(SAFETYNET_COMPONENT);
-	rm_list(SAFETYNET_PROCESS);
-	init_list(SAFETYNET_PKG, SAFETYNET_PROCESS);
-	init_list(MICROG_SAFETYNET, SAFETYNET_PROCESS);
+	init_list(GMS_PKG, SNET_PROC);
+	init_list(MICROG_PKG, SNET_PROC);
+
+	// We also need to hide the default GMS process if MAGISKTMP != /sbin
+	// The snet process communicates with the main process and get additional info
+	if (MAGISKTMP != "/sbin")
+		init_list(GMS_PKG, GMS_PKG);
 
 	update_uid_map();
 	return true;
@@ -248,83 +214,80 @@ void ls_list(int client) {
 	close(client);
 }
 
-static void set_hide_config() {
+static void update_hide_config() {
 	char sql[64];
 	sprintf(sql, "REPLACE INTO settings (key,value) VALUES('%s',%d)",
-			DB_SETTING_KEYS[HIDE_CONFIG], hide_enabled);
+			DB_SETTING_KEYS[HIDE_CONFIG], hide_state);
 	char *err = db_exec(sql);
 	db_err(err);
 }
 
-static inline void launch_err(int client, int code = DAEMON_ERROR) {
-	if (code != HIDE_IS_ENABLED)
-		hide_enabled = false;
-	if (client >= 0) {
-		write_int(client, code);
-		close(client);
-	}
-	pthread_exit(nullptr);
-}
+int launch_magiskhide() {
+	mutex_guard g(hide_state_lock);
 
-#define LAUNCH_ERR launch_err(client)
-
-void launch_magiskhide(int client) {
 	if (SDK_INT < 19)
-		LAUNCH_ERR;
+		return DAEMON_ERROR;
 
-	if (hide_enabled)
-		launch_err(client, HIDE_IS_ENABLED);
+	if (hide_state)
+		return HIDE_IS_ENABLED;
 
 	if (access("/proc/1/ns/mnt", F_OK) != 0)
-		launch_err(client, HIDE_NO_NS);
-
-	hide_enabled = true;
-	set_hide_config();
-	LOGI("* Starting MagiskHide\n");
+		return HIDE_NO_NS;
 
 	if (procfp == nullptr && (procfp = opendir("/proc")) == nullptr)
-		LAUNCH_ERR;
+		return DAEMON_ERROR;
 
-	hide_sensitive_props();
+	LOGI("* Starting MagiskHide\n");
 
 	// Initialize the mutex lock
 	pthread_mutex_init(&monitor_lock, nullptr);
 
 	// Initialize the hide list
 	if (!init_list())
-		LAUNCH_ERR;
+		return DAEMON_ERROR;
 
-	// Get thread reference
-	proc_monitor_thread = pthread_self();
-	if (client >= 0) {
-		write_int(client, DAEMON_SUCCESS);
-		close(client);
-		client = -1;
-	}
+	hide_sensitive_props();
+	if (DAEMON_STATE >= STATE_BOOT_COMPLETE)
+		hide_late_sensitive_props();
+
 	// Start monitoring
-	proc_monitor();
+	void *(*start)(void*) = [](void*) -> void* { proc_monitor(); return nullptr; };
+	if (xpthread_create(&proc_monitor_thread, nullptr, start, nullptr))
+		return DAEMON_ERROR;
 
-	// proc_monitor should not return
-	LAUNCH_ERR;
+	hide_state = true;
+	update_hide_config();
+	return DAEMON_SUCCESS;
 }
 
 int stop_magiskhide() {
-	LOGI("* Stopping MagiskHide\n");
+	mutex_guard g(hide_state_lock);
 
-	hide_enabled = false;
-	set_hide_config();
-	pthread_kill(proc_monitor_thread, SIGTERMTHRD);
+	if (hide_state) {
+		LOGI("* Stopping MagiskHide\n");
+		pthread_kill(proc_monitor_thread, SIGTERMTHRD);
+	}
 
+	hide_state = false;
+	update_hide_config();
 	return DAEMON_SUCCESS;
 }
 
 void auto_start_magiskhide() {
-	db_settings dbs;
-	get_db_settings(dbs, HIDE_CONFIG);
-	if (dbs[HIDE_CONFIG]) {
-		new_daemon_thread([](auto) -> void* {
-			launch_magiskhide(-1);
-			return nullptr;
-		});
+	if (hide_enabled()) {
+		pthread_kill(proc_monitor_thread, SIGZYGOTE);
+		hide_late_sensitive_props();
+	} else if (SDK_INT >= 19) {
+		db_settings dbs;
+		get_db_settings(dbs, HIDE_CONFIG);
+		if (dbs[HIDE_CONFIG])
+			launch_magiskhide();
 	}
+}
+
+void test_proc_monitor() {
+	if (procfp == nullptr && (procfp = opendir("/proc")) == nullptr)
+		exit(1);
+	proc_monitor();
+	exit(0);
 }

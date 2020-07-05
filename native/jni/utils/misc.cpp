@@ -1,6 +1,10 @@
 /* misc.cpp - Store all functions that are unable to be catagorized clearly
  */
- 
+
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <sys/prctl.h>
+#include <sys/sysmacros.h>
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -8,21 +12,12 @@
 #include <pwd.h>
 #include <unistd.h>
 #include <syscall.h>
-#include <sys/types.h>
-#include <sys/wait.h>
-#include <sys/prctl.h>
-#include <sys/sysmacros.h>
+#include <random>
+#include <string>
 
-#include <logging.h>
-#include <utils.h>
+#include <utils.hpp>
 
-unsigned get_shell_uid() {
-	struct passwd* ppwd = getpwnam("shell");
-	if (nullptr == ppwd)
-		return 2000;
-
-	return ppwd->pw_uid;
-}
+using namespace std;
 
 int fork_dont_care() {
 	int pid = xfork();
@@ -49,18 +44,29 @@ int fork_no_zombie() {
 	return 0;
 }
 
-static bool rand_init = false;
-
-void gen_rand_str(char *buf, int len) {
-	constexpr const char base[] = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-	if (!rand_init) {
-		srand(time(nullptr));
-		rand_init = true;
+constexpr char ALPHANUM[] = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+static bool seeded = false;
+static std::mt19937 gen;
+static std::uniform_int_distribution<int> dist(0, sizeof(ALPHANUM) - 2);
+int gen_rand_str(char *buf, int len, bool varlen) {
+	if (!seeded) {
+		if (access("/dev/urandom", F_OK) != 0)
+			mknod("/dev/urandom", 0600 | S_IFCHR, makedev(1, 9));
+		int fd = xopen("/dev/urandom", O_RDONLY | O_CLOEXEC);
+		unsigned seed;
+		xxread(fd, &seed, sizeof(seed));
+		gen.seed(seed);
+		close(fd);
+		seeded = true;
 	}
-	for (int i = 0; i < len - 1; ++i) {
-		buf[i] = base[rand() % (sizeof(base) - 1)];
+	if (varlen) {
+		std::uniform_int_distribution<int> len_dist(len / 2, len);
+		len = len_dist(gen);
 	}
+	for (int i = 0; i < len - 1; ++i)
+		buf[i] = ALPHANUM[dist(gen)];
 	buf[len - 1] = '\0';
+	return len - 1;
 }
 
 int strend(const char *s1, const char *s2) {
@@ -69,82 +75,9 @@ int strend(const char *s1, const char *s2) {
 	return strcmp(s1 + l1 - l2, s2);
 }
 
-/* Original source: https://opensource.apple.com/source/cvs/cvs-19/cvs/lib/getline.c
- * License: GPL 2 or later
- * Adjusted to match POSIX */
-#define MIN_CHUNK 64
-ssize_t __getdelim(char **lineptr, size_t *n, int delim, FILE *stream) {
-	size_t nchars_avail;
-	char *read_pos;
-
-	if (!lineptr || !n || !stream) {
-		errno = EINVAL;
-		return -1;
-	}
-
-	if (!*lineptr) {
-		*n = MIN_CHUNK;
-		*lineptr = (char *) malloc(*n);
-		if (!*lineptr) {
-			errno = ENOMEM;
-			return -1;
-		}
-	}
-
-	nchars_avail = *n;
-	read_pos = *lineptr;
-
-	while (1) {
-		int save_errno;
-		int c = getc(stream);
-
-		save_errno = errno;
-
-		if (nchars_avail < 2) {
-			if (*n > MIN_CHUNK)
-				*n *= 2;
-			else
-				*n += MIN_CHUNK;
-
-			nchars_avail = *n + *lineptr - read_pos;
-			*lineptr = (char *) realloc(*lineptr, *n);
-			if (!*lineptr) {
-				errno = ENOMEM;
-				return -1;
-			}
-			read_pos = *n - nchars_avail + *lineptr;
-		}
-
-		if (ferror(stream)) {
-			errno = save_errno;
-			return -1;
-		}
-
-		if (c == EOF) {
-			if (read_pos == *lineptr)
-				return -1;
-			else
-				break;
-		}
-
-		*read_pos++ = c;
-		nchars_avail--;
-
-		if (c == delim)
-			break;
-	}
-
-	*read_pos = '\0';
-
-	return read_pos - *lineptr;
-}
-
-ssize_t __getline(char **lineptr, size_t *n, FILE *stream) {
-	return __getdelim(lineptr, n, '\n', stream);
-}
-
 int exec_command(exec_t &exec) {
-	int pipefd[2] = {-1, -1}, outfd = -1;
+	int pipefd[] = {-1, -1};
+	int outfd = -1;
 
 	if (exec.fd == -1) {
 		if (xpipe2(pipefd, O_CLOEXEC) == -1)
@@ -184,20 +117,31 @@ int exec_command(exec_t &exec) {
 }
 
 int exec_command_sync(exec_t &exec) {
-	int pid, status;
-	pid = exec_command(exec);
+	int pid = exec_command(exec);
 	if (pid < 0)
 		return -1;
+	int status;
 	waitpid(pid, &status, 0);
 	return WEXITSTATUS(status);
 }
 
-int new_daemon_thread(void *(*start_routine) (void *), void *arg, const pthread_attr_t *attr) {
+int new_daemon_thread(thread_entry entry, void *arg, const pthread_attr_t *attr) {
 	pthread_t thread;
-	int ret = xpthread_create(&thread, attr, start_routine, arg);
+	int ret = xpthread_create(&thread, attr, entry, arg);
 	if (ret == 0)
 		pthread_detach(thread);
 	return ret;
+}
+
+static void *proxy_routine(void *fp) {
+	auto fn = reinterpret_cast<std::function<void()>*>(fp);
+	(*fn)();
+	delete fn;
+	return nullptr;
+}
+
+int new_daemon_thread(std::function<void()> &&entry) {
+	return new_daemon_thread(proxy_routine, new std::function<void()>(std::move(entry)));
 }
 
 static char *argv0;
@@ -219,14 +163,6 @@ bool ends_with(const std::string_view &s1, const std::string_view &s2) {
 	return l1 < l2 ? false : s1.compare(l1 - l2, l2, s2) == 0;
 }
 
-char *rtrim(char *str) {
-	int len = strlen(str);
-	while (len > 0 && str[len - 1] == ' ')
-		--len;
-	str[len] = '\0';
-	return str;
-}
-
 /*
  * Bionic's atoi runs through strtol().
  * Use our own implementation for faster conversion.
@@ -240,4 +176,44 @@ int parse_int(const char *s) {
 		val = val * 10 + c - '0';
 	}
 	return val;
+}
+
+uint32_t binary_gcd(uint32_t u, uint32_t v) {
+	if (u == 0) return v;
+	if (v == 0) return u;
+	auto shift = __builtin_ctz(u | v);
+	u >>= __builtin_ctz(u);
+	do {
+		v >>= __builtin_ctz(v);
+		if (u > v) {
+			auto t = v;
+			v = u;
+			u = t;
+		}
+		v -= u;
+	} while (v != 0);
+	return u << shift;
+}
+
+int switch_mnt_ns(int pid) {
+	char mnt[32];
+	snprintf(mnt, sizeof(mnt), "/proc/%d/ns/mnt", pid);
+	if (access(mnt, R_OK) == -1) return 1; // Maybe process died..
+
+	int fd, ret;
+	fd = xopen(mnt, O_RDONLY);
+	if (fd < 0) return 1;
+	// Switch to its namespace
+	ret = xsetns(fd, 0);
+	close(fd);
+	return ret;
+}
+
+string &replace_all(string &str, string_view from, string_view to) {
+	size_t pos = 0;
+	while((pos = str.find(from, pos)) != string::npos) {
+		str.replace(pos, from.length(), to);
+		pos += to.length();
+	}
+	return str;
 }

@@ -1,82 +1,44 @@
-/* daemon.c - Magisk Daemon
- *
- * Start the daemon and wait for requests
- * Connect the daemon and send requests through sockets
- */
-
-#include <stdlib.h>
-#include <unistd.h>
 #include <fcntl.h>
-#include <string.h>
 #include <pthread.h>
 #include <signal.h>
+#include <libgen.h>
 #include <sys/un.h>
 #include <sys/types.h>
 #include <sys/mount.h>
+#include <android/log.h>
 
-#include <magisk.h>
-#include <utils.h>
-#include <daemon.h>
-#include <selinux.h>
-#include <db.h>
-#include <resetprop.h>
-#include <flags.h>
+#include <magisk.hpp>
+#include <utils.hpp>
+#include <daemon.hpp>
+#include <selinux.hpp>
+#include <db.hpp>
+#include <resetprop.hpp>
+#include <flags.hpp>
+
+using namespace std;
 
 int SDK_INT = -1;
 bool RECOVERY_MODE = false;
-static struct stat SERVER_STAT;
+string MAGISKTMP;
+int DAEMON_STATE = STATE_UNKNOWN;
 
-static void verify_client(int client, pid_t pid) {
+static struct stat self_st;
+
+static bool verify_client(int client, pid_t pid) {
 	// Verify caller is the same as server
 	char path[32];
 	sprintf(path, "/proc/%d/exe", pid);
-	struct stat st{};
-	stat(path, &st);
-	if (st.st_dev != SERVER_STAT.st_dev || st.st_ino != SERVER_STAT.st_ino) {
-		close(client);
-		pthread_exit(nullptr);
-	}
+	struct stat st;
+	return !(stat(path, &st) || st.st_dev != self_st.st_dev || st.st_ino != self_st.st_ino);
 }
 
-static void *request_handler(void *args) {
-	int client = *((int *) args);
-	delete (int *) args;
-
-	struct ucred credential;
-	get_client_cred(client, &credential);
-	if (credential.uid != 0)
-		verify_client(client, credential.pid);
-
-	int req = read_int(client);
-	switch (req) {
-	case MAGISKHIDE:
-	case POST_FS_DATA:
-	case LATE_START:
-	case BOOT_COMPLETE:
-	case SQLITE_CMD:
-		if (credential.uid != 0) {
-			write_int(client, ROOT_REQUIRED);
-			close(client);
-			return nullptr;
-		}
-	default:
-		break;
-	}
-
-	switch (req) {
+static void request_handler(int client, int req_code, ucred cred) {
+	switch (req_code) {
 	case MAGISKHIDE:
 		magiskhide_handler(client);
 		break;
 	case SUPERUSER:
-		su_daemon_handler(client, &credential);
-		break;
-	case CHECK_VERSION:
-		write_string(client, MAGISK_VERSION ":MAGISK");
-		close(client);
-		break;
-	case CHECK_VERSION_CODE:
-		write_int(client, MAGISK_VER_CODE);
-		close(client);
+		su_daemon_handler(client, &cred);
 		break;
 	case POST_FS_DATA:
 		post_fs_data(client);
@@ -90,44 +52,155 @@ static void *request_handler(void *args) {
 	case SQLITE_CMD:
 		exec_sql(client);
 		break;
+	case REMOVE_MODULES:
+		foreach_modules("remove");
+		write_int(client, 0);
+		close(client);
+		reboot();
+		break;
 	default:
 		close(client);
 		break;
 	}
-	return nullptr;
 }
 
-static void main_daemon() {
-	android_logging();
-	setsid();
-	setcon("u:r:" SEPOL_PROC_DOMAIN ":s0");
-	restore_rootcon();
+static void handle_request(int client) {
+	int req_code;
 
-	int fd = xopen("/dev/null", O_RDWR | O_CLOEXEC);
+	// Verify client credentials
+	ucred cred;
+	get_client_cred(client, &cred);
+	if (cred.uid != 0 && !verify_client(client, cred.pid))
+		goto shortcut;
+
+	// Check client permissions
+	req_code = read_int(client);
+	switch (req_code) {
+	case MAGISKHIDE:
+	case POST_FS_DATA:
+	case LATE_START:
+	case BOOT_COMPLETE:
+	case SQLITE_CMD:
+	case GET_PATH:
+		if (cred.uid != 0) {
+			write_int(client, ROOT_REQUIRED);
+			goto shortcut;
+		}
+		break;
+	case REMOVE_MODULES:
+		if (cred.uid != UID_SHELL && cred.uid != UID_ROOT) {
+			write_int(client, 1);
+			goto shortcut;
+		}
+		break;
+	}
+
+	switch (req_code) {
+	// In case of init trigger launches, set the corresponding states
+	case POST_FS_DATA:
+		DAEMON_STATE = STATE_POST_FS_DATA;
+		break;
+	case LATE_START:
+		DAEMON_STATE = STATE_LATE_START;
+		break;
+	case BOOT_COMPLETE:
+		DAEMON_STATE = STATE_BOOT_COMPLETE;
+		break;
+
+	// Simple requests to query daemon info
+	case CHECK_VERSION:
+		write_string(client, MAGISK_VERSION ":MAGISK");
+		goto shortcut;
+	case CHECK_VERSION_CODE:
+		write_int(client, MAGISK_VER_CODE);
+		goto shortcut;
+	case GET_PATH:
+		write_string(client, MAGISKTMP.data());
+		goto shortcut;
+	case DO_NOTHING:
+		goto shortcut;
+	}
+
+	// Create new thread to handle complex requests
+	new_daemon_thread(std::bind(&request_handler, client, req_code, cred));
+	return;
+
+shortcut:
+	close(client);
+}
+
+#define vlog __android_log_vprint
+
+static void android_logging() {
+	static constexpr char TAG[] = "Magisk";
+	log_cb.d = [](auto fmt, auto ap){ return vlog(ANDROID_LOG_DEBUG, TAG, fmt, ap); };
+	log_cb.i = [](auto fmt, auto ap){ return vlog(ANDROID_LOG_INFO, TAG, fmt, ap); };
+	log_cb.w = [](auto fmt, auto ap){ return vlog(ANDROID_LOG_WARN, TAG, fmt, ap); };
+	log_cb.e = [](auto fmt, auto ap){ return vlog(ANDROID_LOG_ERROR, TAG, fmt, ap); };
+	log_cb.ex = nop_ex;
+}
+
+static void daemon_entry(int ppid) {
+	android_logging();
+
+	int fd = xopen("/dev/null", O_WRONLY);
 	xdup2(fd, STDOUT_FILENO);
 	xdup2(fd, STDERR_FILENO);
-	close(fd);
-	fd = xopen("/dev/zero", O_RDWR | O_CLOEXEC);
+	if (fd > STDERR_FILENO)
+		close(fd);
+	fd = xopen("/dev/zero", O_RDONLY);
 	xdup2(fd, STDIN_FILENO);
-	close(fd);
+	if (fd > STDERR_FILENO)
+		close(fd);
 
-	LOGI(SHOW_VER(Magisk) " daemon started\n");
+	setsid();
+	setcon("u:r:" SEPOL_PROC_DOMAIN ":s0");
 
-	// Get server stat
-	stat("/proc/self/exe", &SERVER_STAT);
+	// Make sure ppid is not in acct
+	char src[64], dest[64];
+	sprintf(src, "/acct/uid_0/pid_%d", ppid);
+	sprintf(dest, "/acct/uid_0/pid_%d", getpid());
+	rename(src, dest);
+
+	// Get self stat
+	xreadlink("/proc/self/exe", src, sizeof(src));
+	MAGISKTMP = dirname(src);
+	xstat("/proc/self/exe", &self_st);
+
+	restore_tmpcon();
+
+	// SAR cleanups
+	auto mount_list = MAGISKTMP + "/" ROOTMNT;
+	if (access(mount_list.data(), F_OK) == 0) {
+		file_readline(true, mount_list.data(), [](string_view line) -> bool {
+			umount2(line.data(), MNT_DETACH);
+			return true;
+		});
+	}
+	unlink("/dev/.se");
+
+	LOGI(NAME_WITH_VER(Magisk) " daemon started\n");
 
 	// Get API level
 	parse_prop_file("/system/build.prop", [](auto key, auto val) -> bool {
 		if (key == "ro.build.version.sdk") {
-			LOGI("* Device API level: %s\n", val.data());
 			SDK_INT = parse_int(val);
 			return false;
 		}
 		return true;
 	});
+	if (SDK_INT < 0) {
+		// In case some devices do not store this info in build.prop, fallback to getprop
+		auto sdk = getprop("ro.build.version.sdk");
+		if (!sdk.empty()) {
+			SDK_INT = parse_int(sdk);
+		}
+	}
+	LOGI("* Device API level: %d\n", SDK_INT);
 
 	// Load config status
-	parse_prop_file(MAGISKTMP "/config", [](auto key, auto val) -> bool {
+	auto config = MAGISKTMP + "/" INTLROOT "/config";
+	parse_prop_file(config.data(), [](auto key, auto val) -> bool {
 		if (key == "RECOVERYMODE" && val == "true")
 			RECOVERY_MODE = true;
 		return true;
@@ -150,24 +223,9 @@ static void main_daemon() {
 
 	// Loop forever to listen for requests
 	for (;;) {
-		int *client = new int;
-		*client = xaccept4(fd, nullptr, nullptr, SOCK_CLOEXEC);
-		new_daemon_thread(request_handler, client);
+		int client = xaccept4(fd, nullptr, nullptr, SOCK_CLOEXEC);
+		handle_request(client);
 	}
-}
-
-int switch_mnt_ns(int pid) {
-	char mnt[32];
-	snprintf(mnt, sizeof(mnt), "/proc/%d/ns/mnt", pid);
-	if (access(mnt, R_OK) == -1) return 1; // Maybe process died..
-
-	int fd, ret;
-	fd = xopen(mnt, O_RDONLY);
-	if (fd < 0) return 1;
-	// Switch to its namespace
-	ret = xsetns(fd, 0);
-	close(fd);
-	return ret;
 }
 
 int connect_daemon(bool create) {
@@ -180,10 +238,11 @@ int connect_daemon(bool create) {
 			exit(1);
 		}
 
+		int ppid = getpid();
 		LOGD("client: launching new main daemon process\n");
 		if (fork_dont_care() == 0) {
 			close(fd);
-			main_daemon();
+			daemon_entry(ppid);
 		}
 
 		while (connect(fd, (struct sockaddr*) &sun, len))

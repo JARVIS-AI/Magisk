@@ -6,26 +6,31 @@
 #include <string.h>
 #include <sys/wait.h>
 #include <sys/types.h>
+#include <sys/mount.h>
 
-#include <magisk.h>
-#include <daemon.h>
-#include <flags.h>
+#include <daemon.hpp>
+#include <utils.hpp>
 
-#include "magiskhide.h"
+#include "magiskhide.hpp"
 
-bool hide_enabled = false;
+using namespace std::literals;
 
 [[noreturn]] static void usage(char *arg0) {
 	fprintf(stderr,
-		FULL_VER(MagiskHide) "\n\n"
-		"Usage: %s [--option [arguments...] ]\n\n"
-		"Options:\n"
-  		"  --status          Return the status of magiskhide\n"
-		"  --enable          Start magiskhide\n"
-		"  --disable         Stop magiskhide\n"
-		"  --add PKG [PROC]  Add a new target to the hide list\n"
-		"  --rm PKG [PROC]   Remove from the hide list\n"
-		"  --ls              List the current hide list\n"
+		"MagiskHide - Hide Config CLI\n\n"
+		"Usage: %s [action [arguments...] ]\n\n"
+		"Actions:\n"
+  		"   status          Return the status of magiskhide\n"
+		"   enable          Start magiskhide\n"
+		"   disable         Stop magiskhide\n"
+		"   add PKG [PROC]  Add a new target to the hide list\n"
+		"   rm PKG [PROC]   Remove target(s) from the hide list\n"
+		"   ls              Print the current hide list\n"
+		"   exec CMDs...    Execute commands in isolated mount\n"
+		"                   namespace and do all hide unmounts\n"
+#ifdef MAGISK_DEBUG
+		"   test            Run process monitor test\n"
+#endif
 		, arg0);
 	exit(1);
 }
@@ -39,7 +44,7 @@ void magiskhide_handler(int client) {
 	case ADD_HIDELIST:
 	case RM_HIDELIST:
 	case LS_HIDELIST:
-		if (!hide_enabled) {
+		if (!hide_enabled()) {
 			write_int(client, HIDE_NOT_ENABLED);
 			close(client);
 			return;
@@ -48,8 +53,8 @@ void magiskhide_handler(int client) {
 
 	switch (req) {
 	case LAUNCH_MAGISKHIDE:
-		launch_magiskhide(client);
-		return;
+		res = launch_magiskhide();
+		break;
 	case STOP_MAGISKHIDE:
 		res = stop_magiskhide();
 		break;
@@ -61,10 +66,9 @@ void magiskhide_handler(int client) {
 		break;
 	case LS_HIDELIST:
 		ls_list(client);
-		client = -1;
-		break;
+		return;
 	case HIDE_STATUS:
-		res = hide_enabled ? HIDE_IS_ENABLED : HIDE_NOT_ENABLED;
+		res = hide_enabled() ? HIDE_IS_ENABLED : HIDE_NOT_ENABLED;
 		break;
 	}
 
@@ -76,19 +80,35 @@ int magiskhide_main(int argc, char *argv[]) {
 	if (argc < 2)
 		usage(argv[0]);
 
+	// CLI backwards compatibility
+	const char *opt = argv[1];
+	if (opt[0] == '-' && opt[1] == '-')
+		opt += 2;
+
 	int req;
-	if (strcmp(argv[1], "--enable") == 0)
+	if (opt == "enable"sv)
 		req = LAUNCH_MAGISKHIDE;
-	else if (strcmp(argv[1], "--disable") == 0)
+	else if (opt == "disable"sv)
 		req = STOP_MAGISKHIDE;
-	else if (strcmp(argv[1], "--add") == 0 && argc > 2)
+	else if (opt == "add"sv)
 		req = ADD_HIDELIST;
-	else if (strcmp(argv[1], "--rm") == 0 && argc > 2)
+	else if (opt == "rm"sv)
 		req = RM_HIDELIST;
-	else if (strcmp(argv[1], "--ls") == 0)
+	else if (opt == "ls"sv)
 		req = LS_HIDELIST;
-	else if (strcmp(argv[1], "--status") == 0)
+	else if (opt == "status"sv)
 		req = HIDE_STATUS;
+	else if (opt == "exec"sv && argc > 2) {
+		xunshare(CLONE_NEWNS);
+		xmount(nullptr, "/", nullptr, MS_PRIVATE | MS_REC, nullptr);
+		hide_unmount();
+		execvp(argv[2], argv + 2);
+		exit(1);
+	}
+#if 0
+	else if (opt == "test"sv)
+		test_proc_monitor();
+#endif
 	else
 		usage(argv[0]);
 
@@ -123,8 +143,9 @@ int magiskhide_main(int argc, char *argv[]) {
 	case HIDE_NO_NS:
 		fprintf(stderr, "Your kernel doesn't support mount namespace\n");
 		break;
-
-	/* Errors */
+	case HIDE_INVALID_PKG:
+		fprintf(stderr, "Invalid package / process name\n");
+		break;
 	case ROOT_REQUIRED:
 		fprintf(stderr, "Root is required for this operation\n");
 		break;

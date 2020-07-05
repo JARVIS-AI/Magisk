@@ -1,68 +1,72 @@
 package com.topjohnwu.magisk.ui.log
 
-import android.content.res.Resources
-import androidx.databinding.ObservableArrayList
-import com.skoumal.teanity.databinding.ComparableRvItem
-import com.skoumal.teanity.extensions.addOnPropertyChangedCallback
-import com.skoumal.teanity.extensions.doOnSuccessUi
-import com.skoumal.teanity.extensions.subscribeK
-import com.skoumal.teanity.util.DiffObservableList
-import com.skoumal.teanity.util.KObservableField
-import com.skoumal.teanity.viewevents.SnackbarEvent
 import com.topjohnwu.magisk.BR
-import com.topjohnwu.magisk.Const
 import com.topjohnwu.magisk.R
-import com.topjohnwu.magisk.data.database.MagiskDB
-import com.topjohnwu.magisk.model.entity.recycler.*
-import com.topjohnwu.magisk.model.events.PageChangedEvent
-import com.topjohnwu.magisk.ui.base.MagiskViewModel
-import com.topjohnwu.magisk.utils.toSingle
-import com.topjohnwu.magisk.utils.zip
+import com.topjohnwu.magisk.core.Config
+import com.topjohnwu.magisk.core.Const
+import com.topjohnwu.magisk.data.repository.LogRepository
+import com.topjohnwu.magisk.extensions.subscribeK
+import com.topjohnwu.magisk.model.entity.recycler.LogItem
+import com.topjohnwu.magisk.model.entity.recycler.TextItem
+import com.topjohnwu.magisk.model.events.SnackbarEvent
+import com.topjohnwu.magisk.ui.base.BaseViewModel
+import com.topjohnwu.magisk.ui.base.diffListOf
+import com.topjohnwu.magisk.ui.base.itemBindingOf
+import com.topjohnwu.magisk.utils.KObservableField
 import com.topjohnwu.superuser.Shell
-import io.reactivex.Single
-import me.tatarka.bindingcollectionadapter2.BindingViewPagerAdapter
-import me.tatarka.bindingcollectionadapter2.OnItemBind
+import io.reactivex.Completable
+import io.reactivex.android.schedulers.AndroidSchedulers
+import io.reactivex.disposables.Disposable
+import io.reactivex.schedulers.Schedulers
+import timber.log.Timber
 import java.io.File
-import java.io.IOException
 import java.util.*
 
 class LogViewModel(
-    private val resources: Resources,
-    private val database: MagiskDB
-) : MagiskViewModel(), BindingViewPagerAdapter.PageTitles<ComparableRvItem<*>> {
+    private val repo: LogRepository
+) : BaseViewModel() {
 
-    val items = DiffObservableList(ComparableRvItem.callback)
-    val itemBinding = OnItemBind<ComparableRvItem<*>> { itemBinding, _, item ->
-        item.bind(itemBinding)
-        itemBinding.bindExtra(BR.viewModel, this@LogViewModel)
-    }
-    val currentPage = KObservableField(0)
-    private val currentItem get() = items[currentPage.value]
+    // --- empty view
 
-    private val logItem get() = items[0] as LogRvItem
-    private val magiskLogItem get() = items[1] as MagiskLogRvItem
+    val itemEmpty = TextItem(R.string.log_data_none)
+    val itemMagiskEmpty = TextItem(R.string.log_data_magisk_none)
 
-    init {
-        currentPage.addOnPropertyChangedCallback {
-            it ?: return@addOnPropertyChangedCallback
-            PageChangedEvent().publish()
-        }
+    // --- su log
 
-        items.addAll(listOf(LogRvItem(), MagiskLogRvItem()))
-        refresh()
+    val items = diffListOf<LogItem>()
+    val itemBinding = itemBindingOf<LogItem> {
+        it.bindExtra(BR.viewModel, this)
     }
 
-    override fun getPageTitle(position: Int, item: ComparableRvItem<*>?) = when (item) {
-        is LogRvItem -> resources.getString(R.string.superuser)
-        is MagiskLogRvItem -> resources.getString(R.string.magisk)
-        else -> ""
+    // --- magisk log
+
+    val consoleText = KObservableField(" ")
+
+    override fun refresh(): Disposable {
+        val logs = repo.fetchLogs()
+            .map { it.map { LogItem(it) } }
+            .observeOn(Schedulers.computation())
+            .map { it to items.calculateDiff(it) }
+            .observeOn(AndroidSchedulers.mainThread())
+            .doOnSuccess {
+                items.firstOrNull()?.isTop = false
+                items.lastOrNull()?.isBottom = false
+
+                items.update(it.first, it.second)
+
+                items.firstOrNull()?.isTop = true
+                items.lastOrNull()?.isBottom = true
+            }
+            .ignoreElement()
+
+        val console = repo.fetchMagiskLogs()
+            .doOnSuccess { consoleText.value = it }
+            .ignoreElement()
+
+        return Completable.merge(listOf(logs, console)).subscribeK()
     }
 
-    fun refresh() = zip(updateLogs(), updateMagiskLog()) { _, _ -> true }
-        .subscribeK()
-        .add()
-
-    fun saveLog() {
+    fun saveMagiskLog() {
         val now = Calendar.getInstance()
         val filename = "magisk_log_%04d%02d%02d_%02d%02d%02d.log".format(
             now.get(Calendar.YEAR), now.get(Calendar.MONTH) + 1,
@@ -70,10 +74,11 @@ class LogViewModel(
             now.get(Calendar.MINUTE), now.get(Calendar.SECOND)
         )
 
-        val logFile = File(Const.EXTERNAL_PATH, filename)
-        try {
+        val logFile = File(Config.downloadDirectory, filename)
+        runCatching {
             logFile.createNewFile()
-        } catch (e: IOException) {
+        }.onFailure {
+            Timber.e(it)
             return
         }
 
@@ -82,41 +87,18 @@ class LogViewModel(
         }
     }
 
-    fun clearLog() = when (currentItem) {
-        is LogRvItem -> clearLogs { refresh() }
-        is MagiskLogRvItem -> clearMagiskLogs { refresh() }
-        else -> Unit
-    }
-
-    private fun clearLogs(callback: () -> Unit) {
-        Single.fromCallable { database.clearLogs() }
-            .subscribeK {
-                SnackbarEvent(R.string.logs_cleared).publish()
-                callback()
-            }
-            .add()
-    }
-
-    private fun clearMagiskLogs(callback: () -> Unit) {
-        Shell.su("echo -n > " + Const.MAGISK_LOG).submit {
+    fun clearMagiskLog() = repo.clearMagiskLogs()
+        .subscribeK {
             SnackbarEvent(R.string.logs_cleared).publish()
-            callback()
+            requestRefresh()
         }
-    }
+        .add()
 
-    private fun updateLogs() = Single.fromCallable { database.logs }
-        .flattenAsFlowable { it }
-        .map { it.map { LogItemEntryRvItem(it) } }
-        .map { LogItemRvItem(ObservableArrayList<ComparableRvItem<*>>().apply { addAll(it) }) }
-        .toList()
-        .doOnSuccessUi { logItem.update(it) }
-
-    private fun updateMagiskLog() = Shell.su("tail -n 5000 ${Const.MAGISK_LOG}").toSingle()
-        .map { it.exec() }
-        .map { it.out }
-        .flattenAsFlowable { it }
-        .map { ConsoleRvItem(it) }
-        .toList()
-        .doOnSuccessUi { magiskLogItem.update(it) }
+    fun clearLog() = repo.clearLogs()
+        .subscribeK {
+            SnackbarEvent(R.string.logs_cleared).publish()
+            requestRefresh()
+        }
+        .add()
 
 }

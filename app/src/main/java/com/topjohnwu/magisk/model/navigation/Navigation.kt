@@ -1,57 +1,30 @@
 package com.topjohnwu.magisk.model.navigation
 
-import com.topjohnwu.magisk.ui.hide.MagiskHideFragment
-import com.topjohnwu.magisk.ui.home.HomeFragment
-import com.topjohnwu.magisk.ui.log.LogFragment
-import com.topjohnwu.magisk.ui.module.ModulesFragment
-import com.topjohnwu.magisk.ui.module.ReposFragment
-import com.topjohnwu.magisk.ui.settings.SettingsFragment
-import com.topjohnwu.magisk.ui.superuser.SuperuserFragment
-
+import android.content.Context
+import android.content.Intent
+import android.os.Build
+import com.topjohnwu.magisk.core.Const
+import com.topjohnwu.magisk.core.intent
+import com.topjohnwu.magisk.ui.MainActivity
 
 object Navigation {
 
-    fun home() = MagiskNavigationEvent {
-        navDirections { destination = HomeFragment::class }
-        navOptions { popUpTo = HomeFragment::class }
+    fun start(launchIntent: Intent, context: Context) {
+        context.intent<MainActivity>()
+            .putExtra(
+                Const.Key.OPEN_SECTION, launchIntent.getStringExtra(
+                    Const.Key.OPEN_SECTION))
+            .putExtra(
+                Const.Key.OPEN_SETTINGS,
+                launchIntent.action == ACTION_APPLICATION_PREFERENCES
+            )
+            .also { context.startActivity(it) }
     }
 
-    fun superuser() = MagiskNavigationEvent {
-        navDirections { destination = SuperuserFragment::class }
-    }
-
-    fun modules() = MagiskNavigationEvent {
-        navDirections { destination = ModulesFragment::class }
-    }
-
-    fun repos() = MagiskNavigationEvent {
-        navDirections { destination = ReposFragment::class }
-    }
-
-    fun hide() = MagiskNavigationEvent {
-        navDirections { destination = MagiskHideFragment::class }
-    }
-
-    fun log() = MagiskNavigationEvent {
-        navDirections { destination = LogFragment::class }
-    }
-
-    fun settings() = MagiskNavigationEvent {
-        navDirections { destination = SettingsFragment::class }
-    }
-
-    fun fromSection(section: String) = when (section) {
-        "superuser" -> superuser()
-        "modules" -> modules()
-        "downloads" -> repos()
-        "magiskhide" -> hide()
-        "log" -> log()
-        "settings" -> settings()
-        else -> home()
-    }
-
-
-    object Main {
-        const val OPEN_NAV = 1
-    }
+    private val ACTION_APPLICATION_PREFERENCES
+        get() = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            Intent.ACTION_APPLICATION_PREFERENCES
+        } else {
+            "cannot be null, cannot be empty"
+        }
 }
